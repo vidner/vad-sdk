@@ -39,6 +39,17 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(decoded["public"], {"id": "1"})
         self.assertEqual(decoded["private"], {"password": "x"})
 
+    def test_successful_put_rejects_non_object_state(self) -> None:
+        now = datetime.datetime.now(datetime.UTC)
+        context = Context("job", 1, "PUT", now, 1, 1, "notes", "team", "10.80.0.1", "store", "flag", None, None)
+        with self.assertRaisesRegex(ValueError, "public state must be an object"):
+            encode_result(
+                context,
+                Result(Outcome.SUCCESS, state=State([], {})),
+                now,
+                now,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

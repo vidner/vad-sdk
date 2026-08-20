@@ -24,6 +24,41 @@ class RunnerConfig:
     fetch_batch: int = 16
 
 
+@dataclasses.dataclass(frozen=True)
+class Execution:
+    result: Result
+    started: datetime.datetime
+    completed: datetime.datetime
+
+
+async def execute_checker(checker: Checker, context: Context) -> Execution:
+    """Execute one checker job with the same semantics used by the NATS runner."""
+    started = datetime.datetime.now(datetime.UTC)
+    timeout = max(0.0, (context.deadline - started).total_seconds())
+    try:
+        async with asyncio.timeout(timeout):
+            if context.operation == "PUT":
+                state = await checker.put(context)
+            elif context.operation == "GET":
+                await checker.get(context)
+                state = None
+            else:
+                await checker.check(context)
+                state = None
+        result = Result(outcome=Outcome.SUCCESS, state=state)
+    except TimeoutError:
+        result = Result(outcome=Outcome.CHECKER_FAILURE, detail_code="timeout")
+    except Exception as error:
+        try:
+            outcome = Outcome(getattr(error, "outcome", Outcome.CHECKER_FAILURE))
+        except ValueError:
+            outcome = Outcome.CHECKER_FAILURE
+        detail = getattr(error, "detail_code", type(error).__name__.lower())
+        result = Result(outcome=outcome, detail_code=str(detail))
+    completed = datetime.datetime.now(datetime.UTC)
+    return Execution(result=result, started=started, completed=completed)
+
+
 class Runner:
     def __init__(self, config: RunnerConfig, checker: Checker) -> None:
         if config.concurrency <= 0 or config.fetch_batch <= 0:
@@ -61,38 +96,19 @@ class Runner:
             except (ValueError, UnicodeError):
                 await message.term()
                 return
-            started = datetime.datetime.now(datetime.UTC)
-            timeout = max(0.0, (context.deadline - started).total_seconds())
-            try:
-                async with asyncio.timeout(timeout):
-                    state = await self._execute(context)
-                result = Result(outcome=Outcome.SUCCESS, state=state)
-            except TimeoutError:
-                result = Result(outcome=Outcome.CHECKER_FAILURE, detail_code="timeout")
-            except Exception as error:
-                try:
-                    outcome = Outcome(getattr(error, "outcome", Outcome.CHECKER_FAILURE))
-                except ValueError:
-                    outcome = Outcome.CHECKER_FAILURE
-                detail = getattr(error, "detail_code", type(error).__name__.lower())
-                result = Result(outcome=outcome, detail_code=str(detail))
-            completed = datetime.datetime.now(datetime.UTC)
-            payload = encode_result(context, result, started, completed)
+            execution = await execute_checker(self._checker, context)
+            payload = encode_result(
+                context,
+                execution.result,
+                execution.started,
+                execution.completed,
+            )
             await jetstream.publish(
                 "checker.results",
                 payload,
                 headers={"Nats-Msg-Id": f"{context.job_id}:{context.attempt}:result"},
             )
             await message.ack_sync()
-
-    async def _execute(self, context: Context) -> State | None:
-        if context.operation == "PUT":
-            return await self._checker.put(context)
-        if context.operation == "GET":
-            await self._checker.get(context)
-            return None
-        await self._checker.check(context)
-        return None
 
 
 def serve(checker: Checker) -> None:

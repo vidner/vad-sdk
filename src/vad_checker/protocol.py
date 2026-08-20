@@ -147,6 +147,8 @@ def _state_object(value: Any, name: str) -> dict[str, Any] | None:
 
 
 def _validate_state_size(value: dict[str, Any], name: str) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} state must be an object")
     encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode()
     if len(encoded) > MAX_STATE_BYTES:
         raise ValueError(f"{name} state is too large")
