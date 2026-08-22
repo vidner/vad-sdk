@@ -1,10 +1,12 @@
+import asyncio
 import datetime
 import sys
 import types
 import unittest
 from unittest import mock
 
-from vad_checker.runner import Runner, RunnerConfig
+from vad_checker.protocol import Outcome
+from vad_checker.runner import Runner, RunnerConfig, execute_checker
 
 
 class StopRunner(Exception):
@@ -65,7 +67,23 @@ class PassingChecker:
         return None
 
 
+class SlowChecker:
+    async def check(self, _context) -> None:
+        await asyncio.sleep(1)
+
+
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_job_deadline_is_a_service_failure(self) -> None:
+        context = types.SimpleNamespace(
+            deadline=datetime.datetime.now(datetime.UTC) + datetime.timedelta(milliseconds=1),
+            operation="CHECK",
+        )
+
+        execution = await execute_checker(SlowChecker(), context)
+
+        self.assertEqual(execution.result.outcome, Outcome.SERVICE_FAILURE)
+        self.assertEqual(execution.result.detail_code, "service_timeout")
+
     async def test_idle_builtin_timeout_does_not_stop_runner(self) -> None:
         subscription = IdleThenStopSubscription()
         connection = FakeConnection(FakeJetStream(subscription))

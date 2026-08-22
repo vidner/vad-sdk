@@ -47,7 +47,7 @@ async def execute_checker(checker: Checker, context: Context) -> Execution:
                 state = None
         result = Result(outcome=Outcome.SUCCESS, state=state)
     except TimeoutError:
-        result = Result(outcome=Outcome.CHECKER_FAILURE, detail_code="timeout")
+        result = Result(outcome=Outcome.SERVICE_FAILURE, detail_code="service_timeout")
     except Exception as error:
         try:
             outcome = Outcome(getattr(error, "outcome", Outcome.CHECKER_FAILURE))

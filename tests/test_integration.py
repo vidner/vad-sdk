@@ -108,7 +108,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_enforces_production_deadline(self) -> None:
         with self.assertRaisesRegex(
             IntegrationError,
-            r"CHECK service failed: CHECKER_FAILURE \(timeout\)",
+            r"CHECK service failed: SERVICE_FAILURE \(service_timeout\)",
         ):
             await run_integration(
                 SlowChecker(),
