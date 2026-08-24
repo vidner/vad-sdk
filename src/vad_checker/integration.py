@@ -13,7 +13,6 @@ import re
 import secrets
 import subprocess
 import sys
-import tempfile
 import typing
 
 from .protocol import Context, Outcome, State, encode_result
@@ -170,9 +169,9 @@ async def run_integration(
     if report is not None:
         report("CHECK before stores: ok")
 
-    for index, store in enumerate(config.stores, start=1):
+    for store in config.stores:
         base = f"integration:{config.run_id}:{store}"
-        flag = f"{config.flag_prefix}{{VAD_INTEGRATION_{config.run_id}_{index}_A}}"
+        flag = f"{config.flag_prefix}{{VAD_INTEGRATION_{store}_{config.run_id}_A}}"
         put = _context(config, "PUT", f"{base}:put:a", store=store, flag=flag)
         first = await successful_put(put)
         await _execute(
@@ -190,7 +189,7 @@ async def run_integration(
             _context(config, "GET", f"{base}:get:a:original", store=store, flag=flag, state=first),
         )
 
-        newer_flag = f"{config.flag_prefix}{{VAD_INTEGRATION_{config.run_id}_{index}_B}}"
+        newer_flag = f"{config.flag_prefix}{{VAD_INTEGRATION_{store}_{config.run_id}_B}}"
         newer = await successful_put(
             _context(config, "PUT", f"{base}:put:b", store=store, flag=newer_flag)
         )
@@ -204,6 +203,13 @@ async def run_integration(
         )
         if report is not None:
             report(f"{store}: PUT/GET/retry/retention ok")
+            report(
+                "STATE "
+                + json.dumps(
+                    {"store": store, "flag": newer_flag, "public": newer.public},
+                    separators=(",", ":"),
+                )
+            )
 
     await _execute(checker, _context(config, "CHECK", f"integration:{config.run_id}:check:after"))
     if report is not None:
@@ -220,7 +226,6 @@ class ProjectConfig:
     timeout: float
     gateway: str
     service_names: tuple[str, ...]
-    published_services: tuple[str, ...]
 
     @property
     def service_compose(self) -> pathlib.Path:
@@ -290,11 +295,8 @@ def _compose_configuration(compose: pathlib.Path) -> dict[str, typing.Any]:
     return value
 
 
-def _gateway_service(
-    services: dict[str, typing.Any], ports: tuple[int, ...]
-) -> tuple[str, tuple[str, ...]]:
+def _gateway_service(services: dict[str, typing.Any], ports: tuple[int, ...]) -> str:
     candidates: set[str] | None = None
-    published: set[str] = set()
     for port in ports:
         matches = {
             name
@@ -311,13 +313,12 @@ def _gateway_service(
             raise IntegrationError(
                 f"manifest port {port} is not published by the service Compose file"
             )
-        published.update(matches)
         candidates = matches if candidates is None else candidates & matches
     if candidates is None or len(candidates) != 1:
         raise IntegrationError(
             "all manifest ports must be published by one Compose gateway service"
         )
-    return next(iter(candidates)), tuple(sorted(published))
+    return next(iter(candidates))
 
 
 def load_project(service: str, start: pathlib.Path | None = None) -> ProjectConfig:
@@ -342,7 +343,7 @@ def load_project(service: str, start: pathlib.Path | None = None) -> ProjectConf
     if not isinstance(flag_prefix, str) or not flag_prefix:
         raise IntegrationError("game flag_prefix must be a non-empty string")
     compose = _compose_configuration(root / "services" / service / "compose.yaml")
-    gateway, published = _gateway_service(compose["services"], tuple(ports))
+    gateway = _gateway_service(compose["services"], tuple(ports))
     return ProjectConfig(
         root=root,
         service=service,
@@ -351,7 +352,6 @@ def load_project(service: str, start: pathlib.Path | None = None) -> ProjectConf
         timeout=_duration(manifest.get("checker_timeout")),
         gateway=gateway,
         service_names=tuple(compose["services"]),
-        published_services=published,
     )
 
 
@@ -422,98 +422,96 @@ def _redact_logs(value: str) -> str:
     return re.sub(r"([?&]token=)[^&\s\"]+", r"\1<redacted>", value)
 
 
-def run_project(project: ProjectConfig) -> None:
-    project_name = f"vad-integration-{project.service}-{secrets.token_hex(4)}"
-    package_directory = pathlib.Path(__file__).resolve().parent
-    override = "services:\n" + "".join(
-        f"  {name}:\n    ports: !reset []\n" for name in project.published_services
+def _running_services(project: ProjectConfig) -> set[str]:
+    result = subprocess.run(
+        ["docker", "compose", "-p", project.service, "-f", str(project.service_compose), "ps", "--format", "json"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
     )
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as overlay:
-        overlay.write(override)
-        overlay.flush()
-        compose = [
-            "docker",
-            "compose",
-            "--project-name",
-            project_name,
-            "-f",
-            str(project.service_compose),
-            "-f",
-            str(project.checker_compose),
-            "-f",
-            overlay.name,
-        ]
+    if result.returncode != 0:
+        return set()
+    running: set[str] = set()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
-            print(f"Starting {project.service} service...", flush=True)
-            _run(
-                [*compose, "up", "--build", "--detach", *project.service_names],
-                quiet=True,
-            )
-            _run([*compose, "build", "checker"], quiet=True)
-            config = json.dumps(
-                {
-                    "service": project.service,
-                    "stores": project.stores,
-                    "host": project.gateway,
-                    "flag_prefix": project.flag_prefix,
-                    "timeout": project.timeout,
-                    "startup_timeout": 60.0,
-                },
-                separators=(",", ":"),
-            )
-            print("Running checker integration...", flush=True)
-            result = _run(
-                [
-                    *compose,
-                    "run",
-                    "--rm",
-                    "-e",
-                    f"VAD_INTEGRATION_CONFIG={config}",
-                    "-e",
-                    "PYTHONPATH=/vad-sdk",
-                    "-e",
-                    "PYTHONUNBUFFERED=1",
-                    "-v",
-                    f"{package_directory}:/vad-sdk/vad_checker:ro",
-                    "checker",
-                    "python",
-                    "-m",
-                    "vad_checker.integration",
-                ],
-                check=False,
-                quiet=True,
-            )
-            if result.stdout:
-                print(result.stdout.rstrip(), flush=True)
-            if result.returncode != 0:
-                if result.stdout and any(
-                    outcome in result.stdout
-                    for outcome in ("SERVICE_FAILURE", "CHECKER_FAILURE")
-                ):
-                    logs = _run(
-                        [*compose, "logs", "--no-color", "--tail", "20"],
-                        check=False,
-                        quiet=True,
-                    )
-                    if logs.stdout:
-                        print(_redact_logs(logs.stdout.rstrip()))
-                raise _ReportedIntegrationError
-            print(f"{project.service}: integration ok", flush=True)
-        finally:
-            _run(
-                [
-                    *compose,
-                    "down",
-                    "--timeout",
-                    "2",
-                    "--volumes",
-                    "--rmi",
-                    "local",
-                    "--remove-orphans",
-                ],
-                check=False,
-                quiet=True,
-            )
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("State") == "running":
+            service = entry.get("Service")
+            if isinstance(service, str):
+                running.add(service)
+    return running
+
+
+def run_project(project: ProjectConfig) -> None:
+    missing = set(project.service_names) - _running_services(project)
+    if missing:
+        print(f"{project.service} is not running ({', '.join(sorted(missing))} not up).", flush=True)
+        print("Start it first, then re-run this command:", flush=True)
+        print(f"  docker compose -f {project.service_compose} up --build -d", flush=True)
+        raise _ReportedIntegrationError
+
+    compose = [
+        "docker",
+        "compose",
+        "--project-name",
+        project.service,
+        "-f",
+        str(project.service_compose),
+        "-f",
+        str(project.checker_compose),
+    ]
+    print(f"{project.service}: attaching checker to the running service...", flush=True)
+    _run([*compose, "build", "checker"], quiet=True)
+    config = json.dumps(
+        {
+            "service": project.service,
+            "stores": project.stores,
+            "host": project.gateway,
+            "flag_prefix": project.flag_prefix,
+            "timeout": project.timeout,
+            "startup_timeout": 60.0,
+        },
+        separators=(",", ":"),
+    )
+    print("Running checker integration...", flush=True)
+    result = _run(
+        [
+            *compose,
+            "run",
+            "--rm",
+            "-e",
+            f"VAD_INTEGRATION_CONFIG={config}",
+            "-e",
+            "PYTHONPATH=/vad-sdk",
+            "-e",
+            "PYTHONUNBUFFERED=1",
+            "-v",
+            f"{pathlib.Path(__file__).resolve().parent}:/vad-sdk/vad_checker:ro",
+            "checker",
+            "python",
+            "-m",
+            "vad_checker.integration",
+        ],
+        check=False,
+        quiet=True,
+    )
+    if result.stdout:
+        print(result.stdout.rstrip(), flush=True)
+    if result.returncode != 0:
+        if result.stdout and any(
+            outcome in result.stdout for outcome in ("SERVICE_FAILURE", "CHECKER_FAILURE")
+        ):
+            logs = _run([*compose, "logs", "--no-color", "--tail", "20"], check=False, quiet=True)
+            if logs.stdout:
+                print(_redact_logs(logs.stdout.rstrip()))
+        raise _ReportedIntegrationError
+    print(f"{project.service}: integration ok", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:

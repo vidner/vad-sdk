@@ -24,9 +24,11 @@ repository containing `game.yaml`, `services/`, and `checkers/`:
 python -m vad_checker.integration notes
 ```
 
-The command builds an isolated Compose project, runs the integration contract
-inside the checker image, prints service logs on failure, and removes its
-containers and volumes afterward. It calls the same library API directly:
+The service must already be running (`docker compose up --build -d` from the
+service's Compose file); the command refuses to start otherwise. It builds the
+checker image, attaches it to the running service, runs the integration
+contract, and prints service logs on failure. It leaves the service running
+afterward, so it calls the same library API directly:
 
 ```python
 import asyncio

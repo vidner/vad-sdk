@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 
 from vad_checker import Context, Outcome, State
@@ -75,6 +76,12 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             ("integration:test:private_notes:put:a", 2),
         ])
         self.assertEqual(messages[-1], "CHECK after stores: ok")
+        state_lines = [message for message in messages if message.startswith("STATE ")]
+        self.assertEqual(len(state_lines), 2)
+        payload = json.loads(state_lines[0].removeprefix("STATE "))
+        self.assertEqual(payload["store"], "private_notes")
+        self.assertEqual(payload["public"], {"id": "state-2"})
+        self.assertEqual(payload["flag"], "CTF{VAD_INTEGRATION_private_notes_test_B}")
 
     async def test_reports_production_outcome_and_detail(self) -> None:
         with self.assertRaisesRegex(
@@ -130,7 +137,7 @@ class ProjectDiscoveryTests(unittest.TestCase):
         self.assertEqual(_duration("1m"), 60.0)
 
     def test_finds_single_gateway_for_manifest_ports(self) -> None:
-        gateway, published = _gateway_service(
+        gateway = _gateway_service(
             {
                 "notes-app": {"ports": [{"target": 10001, "protocol": "tcp"}]},
                 "database": {"ports": []},
@@ -138,7 +145,6 @@ class ProjectDiscoveryTests(unittest.TestCase):
             (10001,),
         )
         self.assertEqual(gateway, "notes-app")
-        self.assertEqual(published, ("notes-app",))
 
     def test_rejects_ports_split_across_containers(self) -> None:
         with self.assertRaisesRegex(IntegrationError, "one Compose gateway"):
